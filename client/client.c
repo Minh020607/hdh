@@ -440,13 +440,6 @@ int main(int argc, char *argv[]) {
     // Tạo WatchArg để truyền vào watch_directory
     WatchArg watch_arg = {watch_path, client_fd};
 
-    // Tạo thread để theo dõi thư mục
-    pthread_t watch_thread;
-    if (pthread_create(&watch_thread, NULL, watch_directory, &watch_arg) != 0) {
-        perror("Lỗi khi tạo thread theo dõi");
-        close(client_fd);
-        return 1;
-    }
 
     // Menu chính
     while (1) {
