@@ -944,20 +944,10 @@ void *watch_directory(void *arg) {
     const char *watch_path = watch_arg->path;
     int sockfd = watch_arg->sockfd;
 
-    // Mở file log
-    FILE *log_file = fopen("client_log.txt", "a");
-    if (log_file == NULL) {
-        perror("Không thể mở file log");
-        free(watch_arg->path);
-        free(watch_arg);
-        pthread_exit(NULL);
-    }
-
     if (sockfd <= 0) {
         fprintf(stderr, "Socket không hợp lệ: %d\n", sockfd);
         free(watch_arg->path);
         free(watch_arg);
-        fclose(log_file);
         pthread_exit(NULL);
     }
 
@@ -966,7 +956,6 @@ void *watch_directory(void *arg) {
         fprintf(stderr, "Đường dẫn '%s' không tồn tại hoặc không phải thư mục.\n", watch_path);
         free(watch_arg->path);
         free(watch_arg);
-        fclose(log_file);
         pthread_exit(NULL);
     }
 
@@ -975,7 +964,6 @@ void *watch_directory(void *arg) {
         perror("Không thể khởi tạo inotify");
         free(watch_arg->path);
         free(watch_arg);
-        fclose(log_file);
         pthread_exit(NULL);
     }
 
@@ -985,11 +973,9 @@ void *watch_directory(void *arg) {
         close(inotify_fd);
         free(watch_arg->path);
         free(watch_arg);
-        fclose(log_file);
         pthread_exit(NULL);
     }
 
-    fprintf(log_file, "Đang theo dõi thư mục: %s\n", watch_path);
     printf("Đang theo dõi thư mục: %s\n", watch_path);
     add_watch_recursive(inotify_fd, watch_path);
 
@@ -1003,7 +989,6 @@ void *watch_directory(void *arg) {
         int ready = select(inotify_fd + 1, &read_fds, NULL, NULL, &timeout);
         if (ready < 0) {
             perror("Lỗi select trong watch_directory");
-            fprintf(log_file, "Lỗi select trong watch_directory\n");
             break;
         }
         if (ready == 0) {
@@ -1013,7 +998,6 @@ void *watch_directory(void *arg) {
         int length = read(inotify_fd, buffer, BUFFER_SIZE);
         if (length < 0 && errno != EAGAIN) {
             perror("Lỗi đọc inotify");
-            fprintf(log_file, "Lỗi đọc inotify\n");
             break;
         }
         if (length <= 0) {
@@ -1040,27 +1024,22 @@ void *watch_directory(void *arg) {
                     if (stat(full_path, &st) == 0) {
                         if (S_ISDIR(st.st_mode)) {
                             printf("[%s] Thư mục mới được tạo: %s\n", time_str, full_path);
-                            fprintf(log_file, "[%s] Thư mục mới được tạo: %s\n", time_str, full_path);
                             add_watch_recursive(inotify_fd, full_path);
                         } else if (S_ISREG(st.st_mode)) {
                             printf("[%s] File mới được tạo: %s\n", time_str, full_path);
-                            fprintf(log_file, "[%s] File mới được tạo: %s\n", time_str, full_path);
                             sync_to_server(full_path, watch_path, sockfd);
                         }
                     }
                 } else if (event->mask & IN_MODIFY) {
                     printf("[%s] File được sửa đổi: %s\n", time_str, full_path);
-                    fprintf(log_file, "[%s] File được sửa đổi: %s\n", time_str, full_path);
                     sync_to_server(full_path, watch_path, sockfd);
                 } else if (event->mask & IN_DELETE) {
                     printf("[%s] File/thư mục bị xóa: %s\n", time_str, full_path);
-                    fprintf(log_file, "[%s] File/thư mục bị xóa: %s\n", time_str, full_path);
                     send_with_mutex(sockfd, "DELETE", 7, 0);
                     send_with_mutex(sockfd, full_path, strlen(full_path) + 1, 0);
                     char response[BUFFER_SIZE];
                     receive_with_mutex(sockfd, response, sizeof(response), 0);
                     printf("[%s] Đã gửi thông báo xóa đến server: %s\n", time_str, full_path);
-                    fprintf(log_file, "[%s] Đã gửi thông báo xóa đến server: %s\n", time_str, full_path);
                 }
             }
             i += sizeof(struct inotify_event) + event->len;
@@ -1071,7 +1050,6 @@ void *watch_directory(void *arg) {
     close(inotify_fd);
     free(watch_arg->path);
     free(watch_arg);
-    fclose(log_file);
     pthread_exit(NULL);
 }
 
