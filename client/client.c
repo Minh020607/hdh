@@ -24,6 +24,7 @@ ssize_t receive_with_mutex(int sockfd, char *buffer, size_t len, int flags);
 #define MAX_CLIENTS 10
 #define MSG_TYPE_SIZE 4
 #define MSG_LEN_SIZE 4
+#define MAX_WATCHES 10
 
 
 uint8_t folder_exist = TRUE;
@@ -34,6 +35,7 @@ uint8_t receive_folder_done = FALSE;
 int client_fd;  // Mã định danh của client
 pthread_mutex_t socket_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_t watch_thread;
+char *watch_paths[MAX_WATCHES] = {0};  // index = wd, value = path
 
 int is_directory(const char *path);
 void receive_response(int client_fd);
@@ -452,7 +454,6 @@ int calculate_file_hash(const char *filepath, unsigned char *hash_out) {
     return 0;
 }
 
-
 // Hàm tạo socket
 int create_client_socket() {
     int client_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -477,7 +478,6 @@ void send_request(int client_fd, const char *message) {
     send(client_fd, message, strlen(message), 0);
 }
 
-//Hàm gửi phàn hồi đến server
 // Hàm gửi response từ server về client
 void send_response(int client_socket, const char *message) {
     if (send(client_socket, message, strlen(message), 0) < 0) {
@@ -760,6 +760,7 @@ void handle_option(int client_fd) {
             list_files(dir_path_2, file_list_in_client, &temp_file_count);
 
             send(client_fd, command, strlen(command), 0);
+            //send_string(client_fd, command);  //  Gửi an toàn và nguyên vẹn
             printf("Đã gửi command đến server: %s\n", command);
             receive_response(client_fd);
 
@@ -967,7 +968,7 @@ void *watch_directory(void *arg) {
         pthread_exit(NULL);
     }
 
-    int wd = inotify_add_watch(inotify_fd, watch_path, IN_CREATE | IN_MODIFY | IN_DELETE);
+    int wd = inotify_add_watch(inotify_fd, watch_path, IN_CREATE | IN_MODIFY | IN_DELETE | IN_CLOSE_WRITE);
     if (wd == -1) {
         perror("Không thể thêm watch");
         close(inotify_fd);
@@ -1009,8 +1010,14 @@ void *watch_directory(void *arg) {
             struct inotify_event *event = (struct inotify_event *)&buffer[i];
             if (event->len) {
                 char full_path[MAX_PATH];
-                snprintf(full_path, sizeof(full_path), "%s/%s", watch_path, event->name);
+                //snprintf(full_path, sizeof(full_path), "%s/%s", watch_path, event->name);
 
+                const char *base = watch_paths[event->wd];  // lấy đúng thư mục gốc mà sự kiện phát sinh
+                if (base) {
+                    snprintf(full_path, sizeof(full_path), "%s/%s", base, event->name);
+                } else {
+                    snprintf(full_path, sizeof(full_path), "%s/%s", watch_path, event->name);  // fallback (dự phòng)
+                }
                 // Lấy thời gian hiện tại
                 time_t now;
                 struct tm *tm_info;
@@ -1025,6 +1032,7 @@ void *watch_directory(void *arg) {
                         if (S_ISDIR(st.st_mode)) {
                             printf("[%s] Thư mục mới được tạo: %s\n", time_str, full_path);
                             add_watch_recursive(inotify_fd, full_path);
+                            //sync_to_server(full_path, watch_path, sockfd);
                         } else if (S_ISREG(st.st_mode)) {
                             printf("[%s] File mới được tạo: %s\n", time_str, full_path);
                             sync_to_server(full_path, watch_path, sockfd);
@@ -1040,6 +1048,12 @@ void *watch_directory(void *arg) {
                     char response[BUFFER_SIZE];
                     receive_with_mutex(sockfd, response, sizeof(response), 0);
                     printf("[%s] Đã gửi thông báo xóa đến server: %s\n", time_str, full_path);
+                } else if (event->mask & IN_CLOSE_WRITE) {
+                    struct stat st;
+                    if (stat(full_path, &st) == 0 && S_ISREG(st.st_mode)) {
+                        printf("[%s] File đã hoàn tất ghi: %s\n", time_str, full_path);
+                        sync_to_server(full_path, watch_path, sockfd);
+                    }   
                 }
             }
             i += sizeof(struct inotify_event) + event->len;
@@ -1063,9 +1077,14 @@ void add_watch_recursive(int inotify_fd, const char *base_path) {
     int wd = inotify_add_watch(inotify_fd, base_path, IN_CREATE | IN_MODIFY | IN_DELETE);
     if (wd == -1) {
         perror("inotify_add_watch thất bại");
-    } else {
+    }
+    else if(wd >= 0) {
+        watch_paths[wd] = strdup(base_path); // Lưu đường dẫn để sử dụng sau này
         printf("Đã thêm watch: %s (wd=%d)\n", base_path, wd);
     }
+    else {
+        printf("Đã thêm watch: %s (wd=%d)\n", base_path, wd);
+    } 
 
     DIR *dir = opendir(base_path);
     if (!dir) return;
@@ -1254,6 +1273,38 @@ ssize_t receive_with_mutex(int sockfd, char *buffer, size_t len, int flags) {
     return bytes_received;
 }
 
+int send_string(int sockfd, const char *str) {
+    int len = strlen(str) + 1; // +1 để gửi cả ký tự '\0'
+    int net_len = htonl(len); // chuyển sang network byte order
+
+    // Gửi độ dài
+    if (send(sockfd, &net_len, sizeof(net_len), 0) <= 0) return -1;
+
+    // Gửi dữ liệu
+    if (send(sockfd, str, len, 0) <= 0) return -1;
+
+    return 0;
+}
+
+int recv_string(int sockfd, char *buffer, size_t buffer_size) {
+    int net_len;
+    if (recv(sockfd, &net_len, sizeof(net_len), 0) <= 0) return -1;
+
+    int len = ntohl(net_len);
+    if (len > buffer_size) return -1; // tránh tràn bộ đệm
+
+    int received = 0;
+    while (received < len) {
+        int r = recv(sockfd, buffer + received, len - received, 0);
+        if (r <= 0) return -1;
+        received += r;
+    }
+
+    return 0;
+}
+
+
+
 void cleanup(int sig) {
     printf("Đang dọn dẹp...\n");
     close(client_fd);
@@ -1261,9 +1312,6 @@ void cleanup(int sig) {
     pthread_join(watch_thread, NULL);
     exit(0);
 }
-
-
-
 
 int main(int argc, char *argv[]) {
     if (argc < 3) {
