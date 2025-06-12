@@ -1104,6 +1104,34 @@ int handle_command(int client_socket) {
                 return -1;
             }
         }
+    } else if (strcmp(command, "RENAME") == 0) {
+        char old_relative_path[PATH_MAX];
+        char new_relative_path[PATH_MAX];
+        char old_full_path[PATH_MAX];
+        char new_full_path[PATH_MAX];
+
+        // Receive old relative path
+        if (receive_directory_path(client_socket, old_relative_path, sizeof(old_relative_path)) == -1) return -1;
+        if (send_response(client_socket, "Received old path") == -1) return -1;
+
+        // Receive new relative path
+        if (receive_directory_path(client_socket, new_relative_path, sizeof(new_relative_path)) == -1) return -1;
+        if (send_response(client_socket, "Received new path") == -1) return -1;
+
+        // Construct full paths on server
+        normalize_path_segment(old_full_path, current_client_sync_base_path, old_relative_path);
+        normalize_path_segment(new_full_path, current_client_sync_base_path, new_relative_path);
+        
+        printf("Server: Renaming %s to %s\n", old_full_path, new_full_path);
+
+        if (rename(old_full_path, new_full_path) == 0) {
+            printf("Server: Renamed successfully.\n");
+            if (send_response(client_socket, "Renamed successfully") == -1) return -1;
+        } else {
+            perror("Server: Error renaming file/directory");
+            if (send_response(client_socket, "Error renaming") == -1) return -1;
+            return -1;
+        }
     }
     return 0;
 }

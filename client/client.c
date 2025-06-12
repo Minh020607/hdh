@@ -15,7 +15,7 @@
 #include <sys/select.h>
 
 #define PORT 8080
-#define BUFFER_SIZE 1024
+#define BUFFER_SIZE MAX_PATH
 #define MAX_PATH    PATH_MAX
 #define TRUE    1
 #define FALSE   0
@@ -37,6 +37,17 @@ typedef struct {
     unsigned char hash[16];
     time_t timestamp;           
 } FileInfo;
+
+typedef struct {
+    uint32_t cookie;
+    int wd;
+    char old_relative_path[PATH_MAX];
+    char old_full_path[PATH_MAX];
+    uint8_t is_dir;
+    uint8_t active;
+} PendingMoveEvent;
+
+PendingMoveEvent pending_move = {0}; // Global variable
 
 int receive_response(int client_fd);
 int send_response(int client_socket, const char *message);
@@ -235,8 +246,6 @@ int receive_file(int socket_fd, const char *base_path) {
 void receive_and_print_tree(int sock) {
     char buffer[2048];
 
-    int bytes_read_unused = 0;
-    
     while (1) {
         memset(buffer, 0, sizeof(buffer)); // Xóa nội dung buffer
         int bytes_read = recv(sock, buffer, sizeof(buffer) - 1, 0);
@@ -656,7 +665,7 @@ void add_watch_recursive(int inotify_fd, const char *path, int *wd_map, int *wd_
     closedir(dir);
 }
 
-void handle_inotify_event(int client_fd, int inotify_fd, const char *base_path, const char *dest_path_unused, int *wd_map, int *wd_count, char **wd_paths) {
+void handle_inotify_event(int client_fd, int inotify_fd, const char *base_path, const char *dest_path_unused_param, int *wd_map, int *wd_count, char **wd_paths) {
     char buffer[INOTIFY_BUFFER_SIZE];
     ssize_t len = read(inotify_fd, buffer, INOTIFY_BUFFER_SIZE);
     printf("Read from inotify: len=%zd\n", len);
@@ -682,7 +691,87 @@ void handle_inotify_event(int client_fd, int inotify_fd, const char *base_path, 
             }
         }
 
-        if (event->mask & IN_CREATE) {
+        if (event->mask & IN_MOVED_FROM) {
+            printf("IN_MOVED_FROM: %s\n", full_path);
+            // If there's an active pending move, and it's not related to this new event (different cookie),
+            // then the previous pending move must have been a move-out. Process it.
+            if (pending_move.active && pending_move.cookie != event->cookie) {
+                printf("Processing previous IN_MOVED_FROM as DELETE (move-out): %s\n", pending_move.old_relative_path);
+                char cmd_out[16];
+                if (pending_move.is_dir) strcpy(cmd_out, "DELETE_DIR");
+                else strcpy(cmd_out, "DELETE_FILE");
+
+                if (send(client_fd, cmd_out, strlen(cmd_out), 0) == -1) return;
+                if (receive_response(client_fd) == -1) return;
+                if (send(client_fd, pending_move.old_relative_path, strlen(pending_move.old_relative_path) + 1, 0) == -1) return;
+                if (receive_response(client_fd) == -1) return;
+                memset(&pending_move, 0, sizeof(PendingMoveEvent)); // Clear after processing
+            }
+
+            // Store current IN_MOVED_FROM event
+            pending_move.cookie = event->cookie;
+            pending_move.wd = event->wd;
+            strncpy(pending_move.old_relative_path, relative_path, sizeof(pending_move.old_relative_path) - 1);
+            pending_move.old_relative_path[sizeof(pending_move.old_relative_path) - 1] = '\0';
+            strncpy(pending_move.old_full_path, full_path, sizeof(pending_move.old_full_path) - 1);
+            pending_move.old_full_path[sizeof(pending_move.old_full_path) - 1] = '\0';
+            pending_move.is_dir = (event->mask & IN_ISDIR) ? 1 : 0;
+            pending_move.active = 1;
+
+        } else if (event->mask & IN_MOVED_TO) {
+            printf("IN_MOVED_TO: %s\n", full_path);
+            if (pending_move.active && pending_move.cookie == event->cookie) {
+                // This is a rename operation
+                printf("RENAME detected: %s -> %s\n", pending_move.old_relative_path, relative_path);
+                strcpy(command, "RENAME");
+                if (send(client_fd, command, strlen(command), 0) == -1) return;
+                if (receive_response(client_fd) == -1) return;
+
+                // Send old path
+                if (send(client_fd, pending_move.old_relative_path, strlen(pending_move.old_relative_path) + 1, 0) == -1) return;
+                if (receive_response(client_fd) == -1) return;
+
+                // Send new path
+                if (send(client_fd, relative_path, strlen(relative_path) + 1, 0) == -1) return;
+                if (receive_response(client_fd) == -1) return;
+
+                // If a directory was renamed, update its mapped path
+                if (pending_move.is_dir) {
+                    for (int i = 0; i < *wd_count; i++) {
+                        if (wd_map[i] == pending_move.wd) {
+                            free(wd_paths[i]);
+                            wd_paths[i] = strdup(full_path);
+                            break;
+                        }
+                    }
+                }
+                memset(&pending_move, 0, sizeof(PendingMoveEvent)); // Clear after rename
+            } else {
+                // This is a move-in from outside. Treat as create.
+                printf("IN_MOVED_TO (from outside): %s\n", full_path);
+                struct stat statbuf;
+                if (stat(full_path, &statbuf) == 0) {
+                    if (S_ISDIR(statbuf.st_mode)) {
+                        add_watch_recursive(inotify_fd, full_path, wd_map, wd_count, wd_paths);
+                        strcpy(command, "CREATE_DIR");
+                        if (send(client_fd, command, strlen(command), 0) == -1) return;
+                        if (receive_response(client_fd) == -1) return;
+                        if (send(client_fd, relative_path, strlen(relative_path) + 1, 0) == -1) return;
+                        if (receive_response(client_fd) == -1) return;
+                    } else {
+                        strcpy(command, "CREATE_FILE");
+                        if (send(client_fd, command, strlen(command), 0) == -1) return;
+                        if (receive_response(client_fd) == -1) return;
+                        if (send_file(client_fd, full_path, relative_path) == -1) return;
+                        if (receive_response(client_fd) == -1) return;
+                    }
+                } else {
+                    perror("Error stat-ing moved-to file");
+                }
+                // Clear pending_move if it was an unrelated move-in.
+                memset(&pending_move, 0, sizeof(PendingMoveEvent));
+            }
+        } else if (event->mask & IN_CREATE) {
             printf("IN_CREATE: %s\n", full_path);
             struct stat statbuf;
             if (stat(full_path, &statbuf) == 0) {
@@ -703,6 +792,8 @@ void handle_inotify_event(int client_fd, int inotify_fd, const char *base_path, 
             } else {
                 perror("Error stat-ing created file");
             }
+            // Clear any pending move-from, as this is a new create.
+            memset(&pending_move, 0, sizeof(PendingMoveEvent));
         } else if (event->mask & IN_MODIFY) {
             printf("IN_MODIFY: %s\n", full_path);
             strcpy(command, "MODIFY_FILE");
@@ -710,8 +801,16 @@ void handle_inotify_event(int client_fd, int inotify_fd, const char *base_path, 
             if (receive_response(client_fd) == -1) return;
             if (send_file(client_fd, full_path, relative_path) == -1) return;
             if (receive_response(client_fd) == -1) return;
+            // Clear any pending move-from, as this is a modify.
+            memset(&pending_move, 0, sizeof(PendingMoveEvent));
         } else if (event->mask & IN_DELETE) {
             printf("IN_DELETE: %s\n", full_path);
+            // If there's a pending move related to this path, clear it.
+            // This scenario means an actual delete happened, not a move.
+            if (pending_move.active && strcmp(pending_move.old_relative_path, relative_path) == 0) {
+                 memset(&pending_move, 0, sizeof(PendingMoveEvent));
+            }
+
             if (event->mask & IN_ISDIR) {
                 strcpy(command, "DELETE_DIR");
                 if (send(client_fd, command, strlen(command), 0) == -1) return;
@@ -726,8 +825,22 @@ void handle_inotify_event(int client_fd, int inotify_fd, const char *base_path, 
                 if (receive_response(client_fd) == -1) return;
             }
         }
-
         p += sizeof(struct inotify_event) + event->len;
+    }
+
+    // After processing all events in the buffer, if a pending_move is still active,
+    // it means it was a move-out that wasn't paired with a MOVED_TO.
+    if (pending_move.active) {
+        printf("Final check: Processing remaining IN_MOVED_FROM as DELETE (move-out): %s\n", pending_move.old_relative_path);
+        char cmd_out[16];
+        if (pending_move.is_dir) strcpy(cmd_out, "DELETE_DIR");
+        else strcpy(cmd_out, "DELETE_FILE");
+
+        if (send(client_fd, cmd_out, strlen(cmd_out), 0) == -1) return;
+        if (receive_response(client_fd) == -1) return;
+        if (send(client_fd, pending_move.old_relative_path, strlen(pending_move.old_relative_path) + 1, 0) == -1) return;
+        if (receive_response(client_fd) == -1) return;
+        memset(&pending_move, 0, sizeof(PendingMoveEvent)); // Clear after processing
     }
 }
 
